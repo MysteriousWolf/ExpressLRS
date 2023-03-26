@@ -4,17 +4,16 @@ import serials_find
 import SerialHelper
 import bootloader
 from query_yes_no import query_yes_no
+from elrs_helpers import ElrsUploadResult
 
-SCRIPT_DEBUG = 0
+
+SCRIPT_DEBUG = False
 
 
 class PassthroughEnabled(Exception):
     pass
 
 class PassthroughFailed(Exception):
-    pass
-
-class WrongTargetSelected(Exception):
     pass
 
 def dbg_print(line=''):
@@ -28,7 +27,7 @@ def _validate_serialrx(rl, config, expected):
         expected = [expected]
     rl.set_delimiters(["# "])
     rl.clear()
-    rl.write_str("get serialrx_%s" % config)
+    rl.write_str("get %s" % config)
     line = rl.read_line(1.).strip()
     for key in expected:
         key = " = %s" % key
@@ -39,8 +38,6 @@ def _validate_serialrx(rl, config, expected):
 
 
 def bf_passthrough_init(port, requestedBaudrate, half_duplex=False):
-    debug = SCRIPT_DEBUG
-
     sys.stdout.flush()
     dbg_print("======== PASSTHROUGH INIT ========")
     dbg_print("  Trying to initialize %s @ %s" % (port, requestedBaudrate))
@@ -61,19 +58,20 @@ def bf_passthrough_init(port, requestedBaudrate, half_duplex=False):
         raise PassthroughEnabled("No CLI available. Already in passthrough mode?, If this fails reboot FC and try again!")
 
     serial_check = []
-    if not _validate_serialrx(rl, "provider", [["CRSF", "ELRS"], "GHST"][half_duplex]):
-        serial_check.append("serialrx_provider != CRSF")
-    if not _validate_serialrx(rl, "inverted", "OFF"):
-        serial_check.append("serialrx_inverted != OFF")
-    if not _validate_serialrx(rl, "halfduplex", ["OFF", "AUTO"]):
-        serial_check.append("serialrx_halfduplex != OFF/AUTO")
+    if not _validate_serialrx(rl, "serialrx_provider", [["CRSF", "ELRS"], "GHST"][half_duplex]):
+        serial_check.append("Serial Receiver Protocol is not set to CRSF! Hint: set serialrx_provider = CRSF")
+    if not _validate_serialrx(rl, "serialrx_inverted", "OFF"):
+        serial_check.append("Serial Receiver UART is inverted! Hint: set serialrx_inverted = OFF")
+    if not _validate_serialrx(rl, "serialrx_halfduplex", ["OFF", "AUTO"]):
+        serial_check.append("Serial Receiver UART is not in full duplex! Hint: set serialrx_halfduplex = OFF")
+    if _validate_serialrx(rl, "rx_spi_protocol", "EXPRESSLRS" ) and serial_check:
+        serial_check = [ "ExpressLRS SPI RX detected\n\nUpdate via betaflight to flash your RX\nhttps://www.expresslrs.org/2.0/hardware/spi-receivers/" ]
 
     if serial_check:
         error = "\n\n [ERROR] Invalid serial RX configuration detected:\n"
         for err in serial_check:
             error += "    !!! %s !!!\n" % err
         error += "\n    Please change the configuration and try again!\n"
-        dbg_print(error)
         raise PassthroughFailed(error)
 
     SerialRXindex = ""
@@ -91,13 +89,13 @@ def bf_passthrough_init(port, requestedBaudrate, half_duplex=False):
             break
 
         if line.startswith("serial"):
-            if debug:
+            if SCRIPT_DEBUG:
                 dbg_print("  '%s'" % line)
             config = re.search('serial ([0-9]+) ([0-9]+) ', line)
             if config and config.group(2) == "64":
                 dbg_print("    ** Serial RX config detected: '%s'" % line)
                 SerialRXindex = config.group(1)
-                if not debug:
+                if not SCRIPT_DEBUG:
                     break
 
     if not SerialRXindex:
@@ -113,18 +111,18 @@ def bf_passthrough_init(port, requestedBaudrate, half_duplex=False):
     dbg_print("======== PASSTHROUGH DONE ========")
 
 
-def reset_to_bootloader(args):
+def reset_to_bootloader(port, baud, target, action, accept=None, half_duplex=False, chip_type='ESP82') -> int:
     dbg_print("======== RESET TO BOOTLOADER ========")
-    s = serial.Serial(port=args.port, baudrate=args.baud,
+    s = serial.Serial(port=port, baudrate=baud,
         bytesize=8, parity='N', stopbits=1,
         timeout=1, xonxoff=0, rtscts=0)
     rl = SerialHelper.SerialHelper(s, 3.)
     rl.clear()
-    if args.half_duplex:
-        BootloaderInitSeq = bootloader.get_init_seq('GHST', args.type)
+    if half_duplex:
+        BootloaderInitSeq = bootloader.get_init_seq('GHST', chip_type)
         dbg_print("  * Using half duplex (GHST)")
     else:
-        BootloaderInitSeq = bootloader.get_init_seq('CRSF', args.type)
+        BootloaderInitSeq = bootloader.get_init_seq('CRSF', chip_type)
         dbg_print("  * Using full duplex (CRSF)")
         #this is the training sequ for the ROM bootloader, we send it here so it doesn't auto-neg to the wrong baudrate by the BootloaderInitSeq that we send to reset ELRS
         rl.write(b'\x07\x07\x12\x20' + 32 * b'\x55')
@@ -132,21 +130,35 @@ def reset_to_bootloader(args):
     rl.write(BootloaderInitSeq)
     s.flush()
     rx_target = rl.read_line().strip()
-    flash_target = re.sub("_VIA_.*", "", args.target.upper())
-    if rx_target == "":
-        dbg_print("Cannot detect RX target, blindly flashing!")
-    elif rx_target != flash_target:
-        if query_yes_no("\n\n\nWrong target selected! your RX is '%s', trying to flash '%s', continue? Y/N\n" % (rx_target, flash_target)):
-            dbg_print("Ok, flashing anyway!")
-        else:
-            raise WrongTargetSelected("Wrong target selected your RX is '%s', trying to flash '%s'" % (rx_target, flash_target))
-    elif flash_target != "":
-        dbg_print("Verified RX target '%s'" % (flash_target))
+    if target is not None:
+        flash_target = re.sub("_VIA_.*", "", target.upper())
+        ignore_incorrect_target = action == "uploadforce"
+        if rx_target == "":
+            dbg_print("Cannot detect RX target, blindly flashing!")
+        elif ignore_incorrect_target:
+            dbg_print(f"Force flashing {flash_target}, detected {rx_target}")
+        elif rx_target != flash_target and rx_target != accept:
+            if query_yes_no("\n\n\nWrong target selected! your RX is '%s', trying to flash '%s', continue? Y/N\n" % (rx_target, flash_target)):
+                dbg_print("Ok, flashing anyway!")
+            else:
+                dbg_print("Wrong target selected your RX is '%s', trying to flash '%s'" % (rx_target, flash_target))
+                return ElrsUploadResult.ErrorMismatch
+        elif flash_target != "":
+            dbg_print("Verified RX target '%s'" % (flash_target))
     time.sleep(.5)
     s.close()
 
+    return ElrsUploadResult.Success
 
-if __name__ == '__main__':
+def init_passthrough(source, target, env):
+    env.AutodetectUploadPort([env])
+    try:
+        bf_passthrough_init(env['UPLOAD_PORT'], env['UPLOAD_SPEED'])
+    except PassthroughEnabled as err:
+        dbg_print(str(err))
+    reset_to_bootloader(env['UPLOAD_PORT'], env['UPLOAD_SPEED'], env['PIOENV'], source[0])
+
+def main(custom_args = None):
     parser = argparse.ArgumentParser(
         description="Initialize BetaFlight passthrough and optionally send a reboot comamnd sequence")
     parser.add_argument("-b", "--baud", type=int, default=420000,
@@ -161,19 +173,27 @@ if __name__ == '__main__':
         dest="half_duplex", help="Use half duplex mode")
     parser.add_argument("-t", "--type", type=str, default="ESP82",
         help="Defines flash target type which is sent to target in reboot command")
-    args = parser.parse_args()
+    parser.add_argument("-a", "--action", type=str, default="upload",
+        help="Upload action: upload (default), or uploadforce to flash even on target mismatch")
+    parser.add_argument("--accept", type=str, default=None,
+        help="Acceptable target to auto-overwrite")
+
+    args = parser.parse_args(custom_args)
 
     if (args.port == None):
         args.port = serials_find.get_serial_port()
 
+    returncode = ElrsUploadResult.Success
     try:
         bf_passthrough_init(args.port, args.baud)
     except PassthroughEnabled as err:
         dbg_print(str(err))
 
     if args.reset_to_bl:
-        try:
-            reset_to_bootloader(args)
-        except WrongTargetSelected as err:
-            dbg_print(str(err))
-            exit(-1)
+        returncode = reset_to_bootloader(args.port, args.baud, args.target, args.action, args.accept, args.half_duplex, args.type)
+
+    return returncode
+
+if __name__ == '__main__':
+    returncode = main()
+    exit(returncode)

@@ -7,21 +7,24 @@
 ///////////////////////////////////////
 // Even though we aren't using anything this keeps the PIO dependency analyzer happy!
 
-#if defined(Regulatory_Domain_AU_915) || defined(Regulatory_Domain_EU_868)  || defined(Regulatory_Domain_IN_866) || defined(Regulatory_Domain_FCC_915) || defined(Regulatory_Domain_AU_433) || defined(Regulatory_Domain_EU_433)
+#if defined(RADIO_SX127X)
 #include "SX127xDriver.h"
-#endif
-
-#if defined(Regulatory_Domain_ISM_2400)
+#elif defined(RADIO_SX128X)
 #include "SX1280Driver.h"
+#else
+#error Invalid radio configuration!
 #endif
 
 ///////////////////////////////////////
+
+extern bool connectionHasModelMatch;
 
 static device_affinity_t *uiDevices;
 static uint8_t deviceCount;
 
 static bool eventFired[2] = {false, false};
 static connectionState_e lastConnectionState[2] = {disconnected, disconnected};
+static bool lastModelMatch[2] = {false, false};
 
 static unsigned long deviceTimeout[16] = {0};
 
@@ -104,19 +107,25 @@ void devicesTriggerEvent()
 {
     eventFired[0] = true;
     eventFired[1] = true;
+    #if defined(PLATFORM_ESP32)
+    // Release teh semaphore so the tasks on core 0 run now
+    xSemaphoreGive(taskSemaphore);
+    #endif
 }
 
-void devicesUpdate(unsigned long now)
+int devicesUpdate(unsigned long now)
 {
     int32_t core = CURRENT_CORE;
 
-    bool handleEvents = eventFired[core==-1?0:core];
+    bool handleEvents = eventFired[core==-1?0:core] || lastConnectionState[core==-1?0:core] != connectionState || lastModelMatch[core==-1?0:core] != connectionHasModelMatch;
     eventFired[core==-1?0:core] = false;
+    lastConnectionState[core==-1?0:core] = connectionState;
+    lastModelMatch[core==-1?0:core] = connectionHasModelMatch;
 
     for(size_t i=0 ; i<deviceCount ; i++)
     {
         if (uiDevices[i].core == core || core == -1) {
-            if ((handleEvents || lastConnectionState[core==-1?0:core] != connectionState) && uiDevices[i].device->event)
+            if (handleEvents && uiDevices[i].device->event)
             {
                 int delay = (uiDevices[i].device->event)();
                 if (delay != DURATION_IGNORE)
@@ -126,18 +135,25 @@ void devicesUpdate(unsigned long now)
             }
         }
     }
-    lastConnectionState[core==-1?0:core] = connectionState;
 
+    int smallest_delay = DURATION_NEVER;
     for(size_t i=0 ; i<deviceCount ; i++)
     {
-        if (uiDevices[i].core == core || core == -1) {
-            if (uiDevices[i].device->timeout && now >= deviceTimeout[i])
+        if ((uiDevices[i].core == core || core == -1) && uiDevices[i].device->timeout)
+        {
+            int delay = deviceTimeout[i] == 0xFFFFFFFF ? DURATION_NEVER : (int)(deviceTimeout[i]-now);
+            if (now >= deviceTimeout[i])
             {
-                int delay = (uiDevices[i].device->timeout)();
+                delay = (uiDevices[i].device->timeout)();
                 deviceTimeout[i] = delay == DURATION_NEVER ? 0xFFFFFFFF : now + delay;
+            }
+            if (delay != DURATION_NEVER)
+            {
+                smallest_delay = (smallest_delay == DURATION_NEVER) ? delay : std::min(smallest_delay, delay);
             }
         }
     }
+    return smallest_delay;
 }
 
 #if defined(PLATFORM_ESP32)
@@ -151,7 +167,9 @@ static void deviceTask(void *pvArgs)
     xSemaphoreGive(completeSemaphore);
     for (;;)
     {
-        devicesUpdate(millis());
+        int delay = devicesUpdate(millis());
+        // sleep the core until the desired time or it's awakened by an event
+        xSemaphoreTake(taskSemaphore, delay == DURATION_NEVER ? portMAX_DELAY : pdMS_TO_TICKS(delay));
     }
 }
 #endif

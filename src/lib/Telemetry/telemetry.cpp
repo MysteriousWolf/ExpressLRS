@@ -1,6 +1,12 @@
 #include <cstdint>
 #include <cstring>
 #include "telemetry.h"
+#include "logging.h"
+
+#if defined(USE_MSP_WIFI) && defined(TARGET_RX) // enable MSP2WIFI for RX only at the moment
+#include "tcpsocket.h"
+extern TCPSOCKET wifi2tcp;
+#endif
 
 #if defined(UNIT_TEST)
 #include <iostream>
@@ -9,7 +15,7 @@ using namespace std;
 
 #if CRSF_RX_MODULE
 
-#include "CRSF.h"
+#include "crsf2msp.h"
 
 Telemetry::Telemetry()
 {
@@ -44,8 +50,15 @@ bool Telemetry::ShouldSendDeviceFrame()
     return deviceFrame;
 }
 
+void Telemetry::CheckCrsfBatterySensorDetected()
+{
+    if (CRSFinBuffer[CRSF_TELEMETRY_TYPE_INDEX] == CRSF_FRAMETYPE_BATTERY_SENSOR)
+    {
+        crsfBatterySensorDetected = true;
+    }
+}
 
-PAYLOAD_DATA(GPS, BATTERY_SENSOR, ATTITUDE, DEVICE_INFO, FLIGHT_MODE, VARIO);
+PAYLOAD_DATA(GPS, BATTERY_SENSOR, ATTITUDE, DEVICE_INFO, FLIGHT_MODE, VARIO, BARO_ALTITUDE);
 
 bool Telemetry::GetNextPayload(uint8_t* nextPayloadSize, uint8_t **payloadData)
 {
@@ -70,16 +83,8 @@ bool Telemetry::GetNextPayload(uint8_t* nextPayloadSize, uint8_t **payloadData)
         payloadTypes[currentPayloadIndex].locked = true;
 
         realLength = CRSF_FRAME_SIZE(payloadTypes[currentPayloadIndex].data[CRSF_TELEMETRY_LENGTH_INDEX]);
-        // search for non zero data from the end
-        while (realLength > 0 && payloadTypes[currentPayloadIndex].data[realLength - 1] == 0)
-        {
-            realLength--;
-        }
-
         if (realLength > 0)
         {
-            // store real length in frame
-            payloadTypes[currentPayloadIndex].data[CRSF_TELEMETRY_LENGTH_INDEX] = realLength - CRSF_FRAME_NOT_COUNTED_BYTES;
             *nextPayloadSize = realLength;
             *payloadData = payloadTypes[currentPayloadIndex].data;
             return true;
@@ -175,6 +180,11 @@ bool Telemetry::RXhandleUARTin(uint8_t data)
                 if (data == crc)
                 {
                     AppendTelemetryPackage(CRSFinBuffer);
+
+                    // Special case to check here and not in AppendTelemetryPackage().  devAnalogVbat sends
+                    // direct to AppendTelemetryPackage() and we want to detect packets only received through serial.
+                    CheckCrsfBatterySensorDetected();
+
                     receivedPackages++;
                     return true;
                 }
@@ -246,20 +256,31 @@ bool Telemetry::AppendTelemetryPackage(uint8_t *package)
             targetIndex = payloadTypesCount - 2;
             targetFound = true;
 
-            // larger msp resonses are sent in two chunks so special handling is needed so both get sent
-            if (header->type == CRSF_FRAMETYPE_MSP_RESP)
-            {
-                // there is already another response stored
-                if (payloadTypes[targetIndex].updated)
+            #if defined(USE_MSP_WIFI) && defined(TARGET_RX)
+                // this probably needs refactoring in the future, I think we should have this telemetry class inside the crsf module
+                if (wifi2tcp.hasClient() && (header->type == CRSF_FRAMETYPE_MSP_RESP || header->type == CRSF_FRAMETYPE_MSP_REQ)) // if we have a client we probs wanna talk to it
                 {
-                    // use other slot
-                    targetIndex = payloadTypesCount - 1;
+                    DBGLN("Got MSP frame, forwarding to client, len: %d", currentTelemetryByte);
+                    crsf2msp.parse(package);
                 }
-
-                // if both slots are taked do not overwrite other data since the first chunk would be lost
-                if (payloadTypes[targetIndex].updated)
+                else // if no TCP client we just want to forward MSP over the link
+            #endif
+            {
+                // larger msp resonses are sent in two chunks so special handling is needed so both get sent
+                if (header->type == CRSF_FRAMETYPE_MSP_RESP)
                 {
-                    targetFound = false;
+                    // there is already another response stored
+                    if (payloadTypes[targetIndex].updated)
+                    {
+                        // use other slot
+                        targetIndex = payloadTypesCount - 1;
+                    }
+
+                    // if both slots are taked do not overwrite other data since the first chunk would be lost
+                    if (payloadTypes[targetIndex].updated)
+                    {
+                        targetFound = false;
+                    }
                 }
             }
         }
